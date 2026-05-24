@@ -1,0 +1,100 @@
+# BetterScan — docker compose
+# 3 servicios + DB + target de prueba. Todos en una red Docker interna.
+# Solo el contenedor "web" publica puertos al host.
+
+services:
+
+  # Aplicación Laravel servida por Apache (+ PHP 8.4 con mod_php).
+  web:
+    build:
+      context: ./laravel
+      dockerfile: Dockerfile
+    container_name: betterscan-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: .env
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_DATABASE: ${DB_DATABASE}
+      DB_USERNAME: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      # Usuario con permisos DDL solo para migraciones/seeders del entrypoint.
+      DB_MIGRATE_USER: root
+      DB_MIGRATE_PASSWORD: ${DB_ROOT_PASSWORD}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      FASTAPI_BASE_URL: ${FASTAPI_BASE_URL}
+    volumes:
+      - ./laravel:/var/www/html
+      # Volumen compartido con FastAPI para los archivos exportados
+      # (-oX/-oN/-oG y salida cruda de gobuster).
+      - results-data:/results:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      fastapi-engine:
+        condition: service_started
+    networks:
+      - app-net
+
+  # Motor de escaneo. Recibe órdenes del web, ejecuta nmap/gobuster
+  # y devuelve los resultados con CVEs enriquecidos.
+  fastapi-engine:
+    build: ./fastapi-engine
+    container_name: betterscan-fastapi
+    restart: unless-stopped
+    environment:
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      LARAVEL_BASE_URL: http://web
+      NVD_API_KEY: ${NVD_API_KEY}
+    volumes:
+      - results-data:/results
+    networks:
+      - app-net
+    # Sin "ports:" — invisible desde el host. Solo le habla "web".
+
+  # Target vulnerable opcional para pruebas (DVWA).
+  target-vulnerable:
+    image: vulnerables/web-dvwa:latest
+    container_name: betterscan-target
+    restart: unless-stopped
+    networks:
+      - app-net
+
+  # Base de datos.
+  mariadb:
+    image: mariadb:12.2.2
+    container_name: betterscan-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      # Necesaria para init.sh: el script crea el usuario de backup
+      # con esta contraseña interpolada desde el .env.
+      DB_BACKUP_PASSWORD: ${DB_BACKUP_PASSWORD}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./laravel/database/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+networks:
+  app-net:
+    driver: bridge
+    name: betterscan-net
+
+volumes:
+  mariadb-data:
+    name: betterscan-mariadb-data
+  results-data:
+    name: betterscan-results
